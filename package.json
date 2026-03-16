@@ -1,0 +1,30 @@
+{
+  "name": "harness-core",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Minimal universal multi-agent harness core",
+  "type": "module",
+  "bin": {
+    "harness": "./bin/harness.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node ./dist/cli/index.js",
+    "dev": "node --enable-source-maps ./dist/cli/index.js",
+    "smoke:multi-worker": "node ./scripts/multi-worker-smoke.mjs",
+    "smoke:restart-reconcile": "node ./scripts/restart-reconcile-smoke.mjs",
+    "smoke:cancel-replay": "node ./scripts/cancel-replay-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
