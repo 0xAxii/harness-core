@@ -24,6 +24,28 @@ function runCli(repoRoot, stateRoot, ...args) {
   }
 }
 
+function runWorkerCli(repoRoot, stateRoot, sessionId, workerInstanceId, ...args) {
+  const output = execFileSync(
+    process.execPath,
+    [join(repoRoot, 'dist', 'cli', 'index.js'), ...args],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        XDG_STATE_HOME: stateRoot,
+        HARNESS_WORKER_TOKEN_FILE: join(stateRoot, 'harness', 'runs', sessionId, 'runtime', 'auth', `${workerInstanceId}.token`),
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+  try {
+    return JSON.parse(output);
+  } catch {
+    return output.trim();
+  }
+}
+
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
@@ -65,12 +87,12 @@ function main() {
     runCli(repoRoot, stateRoot, 'admin', 'assign-attempt', sessionId, 'task-critic', 'attempt-critic', 'worker-critic');
 
     runCli(repoRoot, stateRoot, 'admin', 'send-message', sessionId, 'worker-critic', 'instruction', 'review latest exploit notes');
-    runCli(repoRoot, stateRoot, 'worker', 'report-blocked', sessionId, 'attempt-pwn', '1', 'waiting on crash triage');
-    runCli(repoRoot, stateRoot, 'worker', 'heartbeat', sessionId, 'attempt-pwn', '1', 'triage-resumed', '2');
+    runWorkerCli(repoRoot, stateRoot, sessionId, 'worker-pwn', 'worker', 'report-blocked', sessionId, 'attempt-pwn', '1', 'waiting on crash triage');
+    runWorkerCli(repoRoot, stateRoot, sessionId, 'worker-pwn', 'worker', 'heartbeat', sessionId, 'attempt-pwn', '1', 'triage-resumed', '2');
 
     writeFileSync(artifactPath, 'critic note: exploit path looks stable\n', 'utf8');
-    runCli(repoRoot, stateRoot, 'worker', 'ingest-artifact', sessionId, 'attempt-critic', '1', 'artifact-critic-note', 'note', artifactPath, 'critic note');
-    runCli(repoRoot, stateRoot, 'worker', 'complete', sessionId, 'attempt-critic', '1', 'completed');
+    runWorkerCli(repoRoot, stateRoot, sessionId, 'worker-critic', 'worker', 'ingest-artifact', sessionId, 'attempt-critic', '1', 'artifact-critic-note', 'note', artifactPath, 'critic note');
+    runWorkerCli(repoRoot, stateRoot, sessionId, 'worker-critic', 'worker', 'complete', sessionId, 'attempt-critic', '1', 'completed');
     runCli(repoRoot, stateRoot, 'admin', 'validate-attempt', sessionId, 'attempt-critic', 'operator', 'accepted', 'smoke', 'critic accepted');
 
     const status = runCli(repoRoot, stateRoot, 'admin', 'status', sessionId).result;

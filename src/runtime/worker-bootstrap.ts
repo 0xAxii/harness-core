@@ -1,6 +1,8 @@
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import type { CapabilityProfile } from '../types/model.js';
+
 export interface WorkerBootstrapOptions {
   authorityRoot: string;
   sessionId: string;
@@ -11,6 +13,7 @@ export interface WorkerBootstrapOptions {
   cliPath: string;
   memoryRef?: string;
   memoryPath: string;
+  capabilityProfile: CapabilityProfile;
 }
 
 export function writeWorkerBootstrapScript(options: WorkerBootstrapOptions): string {
@@ -66,6 +69,8 @@ function buildWorkerPrompt(options: WorkerBootstrapOptions): string {
     '',
     `External memory reference: ${options.memoryRef ?? 'none'}`,
     `Working directory: ${options.workingDir}`,
+    `Capability profile: ${JSON.stringify(options.capabilityProfile)}`,
+    'Treat the capability profile as a hard runtime boundary. Do not assume network, browser, shared-write, or publish access beyond what it grants.',
     '',
     'Shell helpers are preloaded in the session:',
     '- harness_attempt_id',

@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, normalize } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 
 const MAX_MEMORY_EXCERPT_BYTES = 16 * 1024;
 
@@ -12,8 +12,18 @@ export function resolveWorkerMemoryPath(
   workerInstanceId: string,
   memoryRef?: string | null,
 ): string {
+  const absoluteRoot = resolve(authorityRoot);
   const ref = normalize(memoryRef && memoryRef.length > 0 ? memoryRef : defaultWorkerMemoryRef(workerInstanceId));
-  return join(authorityRoot, ref);
+  if (isAbsolute(ref)) {
+    throw new Error('memory_ref must be relative to the authority root');
+  }
+  const resolvedPath = resolve(absoluteRoot, ref);
+  const escaped = relative(absoluteRoot, resolvedPath);
+  if (escaped.startsWith('..') || isAbsolute(escaped)) {
+    throw new Error('memory_ref must stay within the authority root');
+  }
+  assertContainedByExistingAncestor(absoluteRoot, resolvedPath);
+  return resolvedPath;
 }
 
 export function ensureWorkerMemoryFile(
@@ -23,8 +33,10 @@ export function ensureWorkerMemoryFile(
   roleLabel: string,
   memoryRef?: string | null,
 ): string {
+  mkdirSync(authorityRoot, { recursive: true });
   const memoryPath = resolveWorkerMemoryPath(authorityRoot, workerInstanceId, memoryRef);
   mkdirSync(dirname(memoryPath), { recursive: true });
+  assertContainedByExistingAncestor(authorityRoot, memoryPath);
   if (!existsSync(memoryPath)) {
     writeFileSync(
       memoryPath,
@@ -64,4 +76,30 @@ export function readWorkerMemory(authorityRoot: string, workerInstanceId: string
     content,
     excerpt: content.slice(0, MAX_MEMORY_EXCERPT_BYTES),
   };
+}
+
+function assertContainedByExistingAncestor(authorityRoot: string, targetPath: string): void {
+  const absoluteRoot = resolve(authorityRoot);
+  if (!existsSync(absoluteRoot)) {
+    return;
+  }
+
+  const canonicalRoot = realpathSync.native(absoluteRoot);
+  const canonicalAncestor = realpathSync.native(findNearestExistingPath(targetPath));
+  const escaped = relative(canonicalRoot, canonicalAncestor);
+  if (escaped.startsWith('..') || isAbsolute(escaped)) {
+    throw new Error('memory_ref must stay within the authority root');
+  }
+}
+
+function findNearestExistingPath(targetPath: string): string {
+  let currentPath = resolve(targetPath);
+  while (!existsSync(currentPath)) {
+    const parentPath = dirname(currentPath);
+    if (parentPath === currentPath) {
+      break;
+    }
+    currentPath = parentPath;
+  }
+  return currentPath;
 }

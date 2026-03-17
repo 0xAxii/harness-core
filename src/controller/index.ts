@@ -1,8 +1,8 @@
 import { createServer, type Server, type Socket } from 'node:net';
-import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { HarnessDatabase } from '../db/index.js';
 import { failure, success, type JsonRpcRequest, type JsonRpcResponse } from '../protocol/jsonrpc.js';
 import type { CapabilityProfile, SessionRecord, TaskRecord, WorkerInstanceRecord } from '../types/model.js';
@@ -15,7 +15,113 @@ export interface ControllerPaths {
   adminSocketPath: string;
 }
 
+interface ArtifactStorageInspection {
+  storageUri: string;
+  digest: string;
+  sizeBytes: number;
+}
+
 const DEFAULT_CLI_PATH = fileURLToPath(new URL('../cli/index.js', import.meta.url));
+const ATTEMPT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const VALIDATION_DECISIONS = new Set(['accepted', 'rejected']);
+const VALIDATION_KINDS = new Set(['inline', 'operator']);
+const ARTIFACT_TRANSITIONS = new Set(['promoted', 'rejected']);
+const NETWORK_PROFILES = new Set(['deny', 'local', 'full']);
+
+function isAttemptTerminalStatus(value: string): value is 'completed' | 'failed' | 'cancelled' {
+  return ATTEMPT_TERMINAL_STATUSES.has(value);
+}
+
+function isValidationDecision(value: string): value is 'accepted' | 'rejected' {
+  return VALIDATION_DECISIONS.has(value);
+}
+
+function isValidationKind(value: string): value is 'inline' | 'operator' {
+  return VALIDATION_KINDS.has(value);
+}
+
+function isArtifactTransition(value: string): value is 'promoted' | 'rejected' {
+  return ARTIFACT_TRANSITIONS.has(value);
+}
+
+function normalizeStringArray(value: unknown, field: string): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw new Error(`${field} must be an array of strings`);
+  }
+  return [...new Set(value.map((item) => item.trim()).filter((item) => item.length > 0))];
+}
+
+function normalizeCapabilityProfile(value: unknown): CapabilityProfile {
+  const source = (value ?? {}) as Record<string, unknown>;
+  const networkProfile = typeof source.network_profile === 'string' ? source.network_profile : 'deny';
+  if (!NETWORK_PROFILES.has(networkProfile)) {
+    throw new Error('capability_profile.network_profile must be one of deny|local|full');
+  }
+  return {
+    fs_scope: normalizeStringArray(source.fs_scope, 'capability_profile.fs_scope'),
+    network_profile: networkProfile as CapabilityProfile['network_profile'],
+    browser_access: Boolean(source.browser_access ?? false),
+    publish_right: Boolean(source.publish_right ?? false),
+    shared_resource_modes: normalizeStringArray(source.shared_resource_modes, 'capability_profile.shared_resource_modes'),
+    secret_classes: normalizeStringArray(source.secret_classes, 'capability_profile.secret_classes'),
+  };
+}
+
+function workerSupportsCapabilities(profile: CapabilityProfile, required: string[]): boolean {
+  for (const capability of required) {
+    if (capability === 'browser_access' && !profile.browser_access) {
+      return false;
+    }
+    if (capability === 'publish_right' && !profile.publish_right) {
+      return false;
+    }
+    if (capability === 'network:deny' && profile.network_profile !== 'deny') {
+      return false;
+    }
+    if (capability === 'network:local' && !['local', 'full'].includes(profile.network_profile)) {
+      return false;
+    }
+    if (capability === 'network:full' && profile.network_profile !== 'full') {
+      return false;
+    }
+    if (capability.startsWith('fs_scope:') && !profile.fs_scope.includes(capability.slice('fs_scope:'.length))) {
+      return false;
+    }
+    if (capability.startsWith('shared_resource_mode:') && !profile.shared_resource_modes.includes(capability.slice('shared_resource_mode:'.length))) {
+      return false;
+    }
+    if (capability.startsWith('secret_class:') && !profile.secret_classes.includes(capability.slice('secret_class:'.length))) {
+      return false;
+    }
+    if (
+      capability !== 'browser_access'
+      && capability !== 'publish_right'
+      && !capability.startsWith('network:')
+      && !capability.startsWith('fs_scope:')
+      && !capability.startsWith('shared_resource_mode:')
+      && !capability.startsWith('secret_class:')
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isPathWithin(root: string, target: string): boolean {
+  let canonicalRoot: string;
+  let canonicalTarget: string;
+  try {
+    canonicalRoot = realpathSync.native(resolve(root));
+    canonicalTarget = realpathSync.native(resolve(target));
+  } catch {
+    return false;
+  }
+  const escaped = relative(canonicalRoot, canonicalTarget);
+  return escaped === '' || (!escaped.startsWith('..') && !isAbsolute(escaped));
+}
 
 export class HarnessController {
   readonly db: HarnessDatabase;
@@ -28,12 +134,21 @@ export class HarnessController {
   }
 
   async listen(): Promise<void> {
+    this.ensureAdminToken(dirname(this.paths.dbPath));
     await Promise.all([
       this.startSocketServer(this.paths.workerSocketPath, (request) => this.handleWorkerRequest(request)),
       this.startSocketServer(this.paths.adminSocketPath, (request) => this.handleAdminRequest(request)),
     ]);
     await this.reconcileWorkers();
     await this.reconcileControllerCommands();
+  }
+
+  async dispatchAdminRequest(request: JsonRpcRequest): Promise<JsonRpcResponse> {
+    return await this.handleAdminRequest(request);
+  }
+
+  async dispatchWorkerRequest(request: JsonRpcRequest): Promise<JsonRpcResponse> {
+    return await this.handleWorkerRequest(request);
   }
 
   async close(): Promise<void> {
@@ -64,6 +179,7 @@ export class HarnessController {
       server.once('error', reject);
       server.listen(socketPath, () => resolve());
     });
+    chmodSync(socketPath, 0o600);
     this.servers.set(socketPath, server);
   }
 
@@ -95,6 +211,10 @@ export class HarnessController {
   }
 
   private async handleAdminRequest(request: JsonRpcRequest): Promise<JsonRpcResponse> {
+    const authFailure = this.authorizeAdminRequest(request);
+    if (authFailure) {
+      return authFailure;
+    }
     switch (request.method) {
       case 'create_session':
         return this.createSession(request);
@@ -131,6 +251,10 @@ export class HarnessController {
   }
 
   private async handleWorkerRequest(request: JsonRpcRequest): Promise<JsonRpcResponse> {
+    const authFailure = this.authorizeWorkerRequest(request);
+    if (authFailure) {
+      return authFailure;
+    }
     switch (request.method) {
       case 'ready':
         return success(request.id, { ok: true });
@@ -140,6 +264,8 @@ export class HarnessController {
         return this.completeAttempt(request);
       case 'poll_messages':
         return this.pollMessages(request);
+      case 'ack_messages':
+        return this.ackMessages(request);
       case 'send_message':
         return this.sendWorkerMessage(request);
       case 'register_artifact':
@@ -181,11 +307,31 @@ export class HarnessController {
   private async launchWorker(request: JsonRpcRequest): Promise<JsonRpcResponse> {
     const params = request.params ?? {};
     const sessionId = String(params.session_id);
+    const session = this.db.getSession(sessionId);
+    if (!session) {
+      return failure(request.id, 404, 'session not found');
+    }
     const now = new Date().toISOString();
-    const capabilityProfile = (params.capability_profile ?? {}) as CapabilityProfile;
+    let capabilityProfile: CapabilityProfile;
+    try {
+      capabilityProfile = normalizeCapabilityProfile(params.capability_profile);
+    } catch (error) {
+      return failure(request.id, 400, 'invalid capability_profile', String(error));
+    }
     const memoryRef = typeof params.memory_ref === 'string' && params.memory_ref.length > 0
       ? params.memory_ref
       : undefined;
+    try {
+      ensureWorkerMemoryFile(
+        session.authority_root,
+        String(params.worker_instance_id),
+        sessionId,
+        String(params.role_label),
+        memoryRef,
+      );
+    } catch (error) {
+      return failure(request.id, 400, 'invalid memory_ref', String(error));
+    }
     const record: WorkerInstanceRecord = {
       worker_instance_id: String(params.worker_instance_id),
       session_id: sessionId,
@@ -201,55 +347,83 @@ export class HarnessController {
       stopped_at: undefined,
       updated_at: now,
     };
-    this.db.insertWorker(record);
-    ensureWorkerMemoryFile(
-      this.resolveAuthorityRoot(sessionId),
-      record.worker_instance_id,
-      sessionId,
-      record.role_label,
-      record.memory_ref,
-    );
     const commandId = randomUUID();
-    this.db.insertControllerCommand({
-      command_id: commandId,
-      session_id: sessionId,
-      kind: 'launch_worker',
-      status: 'pending',
-      step_state: 'launch_requested',
-      payload: { worker_instance_id: record.worker_instance_id },
-      created_at: now,
-      updated_at: now,
+    this.db.transaction(() => {
+      this.db.insertWorker(record);
+      this.db.insertControllerCommand({
+        command_id: commandId,
+        session_id: sessionId,
+        kind: 'launch_worker',
+        status: 'pending',
+        step_state: 'launch_requested',
+        payload: { worker_instance_id: record.worker_instance_id },
+        created_at: now,
+        updated_at: now,
+      });
     });
-    const handle = await this.supervisor.launchWorker({
-      sessionId,
-      workerInstanceId: record.worker_instance_id,
-      roleLabel: record.role_label,
-      generation: record.generation,
-      authorityRoot: this.resolveAuthorityRoot(sessionId),
-      workingDir: process.env.HARNESS_WORKER_CWD ?? process.cwd(),
-      cliPath: process.env.HARNESS_CLI_PATH ?? DEFAULT_CLI_PATH,
-      memoryRef: record.memory_ref,
+    let handle;
+    try {
+      const workerTokenPath = this.rotateWorkerToken(session.authority_root, record.worker_instance_id);
+      handle = await this.supervisor.launchWorker({
+        sessionId,
+        workerInstanceId: record.worker_instance_id,
+        roleLabel: record.role_label,
+        generation: record.generation,
+        authorityRoot: session.authority_root,
+        workingDir: process.env.HARNESS_WORKER_CWD ?? process.cwd(),
+        cliPath: process.env.HARNESS_CLI_PATH ?? DEFAULT_CLI_PATH,
+        memoryRef: record.memory_ref,
+        capabilityProfile: record.capability_profile,
+        workerTokenPath,
+      });
+    } catch (error) {
+      this.db.transaction(() => {
+        this.db.bindWorkerRuntime(record.worker_instance_id, null, 'exited', now);
+        this.db.updateControllerCommand(commandId, 'aborted', 'launch_failed', now);
+        this.db.insertEvent({
+          event_id: randomUUID(),
+          session_id: sessionId,
+          event_type: 'worker_launch_failed',
+          actor: 'controller',
+          subject_type: 'worker_instance',
+          subject_id: record.worker_instance_id,
+          mutation_id: randomUUID(),
+          payload: { error: String(error) },
+          created_at: now,
+        });
+      });
+      return failure(request.id, 500, 'worker launch failed', String(error));
+    }
+    this.db.transaction(() => {
+      this.db.bindWorkerRuntime(record.worker_instance_id, handle.runtimeHandle, 'started', now);
+      this.db.updateControllerCommand(commandId, 'applied', 'started', now);
+      this.db.insertEvent({
+        event_id: randomUUID(),
+        session_id: sessionId,
+        event_type: 'worker_launched',
+        actor: 'controller',
+        subject_type: 'worker_instance',
+        subject_id: record.worker_instance_id,
+        mutation_id: randomUUID(),
+        payload: handle,
+        created_at: now,
+      });
     });
-    this.db.bindWorkerRuntime(record.worker_instance_id, handle.runtimeHandle, 'started', now);
-    this.db.updateControllerCommand(commandId, 'applied', 'started', now);
     this.writeWorkerPacket(sessionId, record.worker_instance_id, record.generation, record.role_label, record.memory_ref ?? null);
-    this.db.insertEvent({
-      event_id: randomUUID(),
-      session_id: sessionId,
-      event_type: 'worker_launched',
-      actor: 'controller',
-      subject_type: 'worker_instance',
-      subject_id: record.worker_instance_id,
-      mutation_id: randomUUID(),
-      payload: handle,
-      created_at: now,
-    });
     return success(request.id, handle);
   }
 
   private createTask(request: JsonRpcRequest): JsonRpcResponse {
     const params = request.params ?? {};
     const now = new Date().toISOString();
+    let requiredCapabilities: string[];
+    let desiredOutputs: string[];
+    try {
+      requiredCapabilities = normalizeStringArray(params.required_capabilities, 'required_capabilities');
+      desiredOutputs = normalizeStringArray(params.desired_outputs, 'desired_outputs');
+    } catch (error) {
+      return failure(request.id, 400, 'invalid task payload', String(error));
+    }
     const record: TaskRecord = {
       task_id: String(params.task_id),
       session_id: String(params.session_id),
@@ -257,10 +431,8 @@ export class HarnessController {
       subject: String(params.subject),
       description: String(params.description),
       priority: typeof params.priority === 'number' ? params.priority : 0,
-      required_capabilities: Array.isArray(params.required_capabilities)
-        ? params.required_capabilities.map(String)
-        : [],
-      desired_outputs: Array.isArray(params.desired_outputs) ? params.desired_outputs.map(String) : [],
+      required_capabilities: requiredCapabilities,
+      desired_outputs: desiredOutputs,
       status: 'open',
       created_at: now,
       updated_at: now,
@@ -319,12 +491,25 @@ export class HarnessController {
     if (!task) {
       return failure(request.id, 404, 'task not found');
     }
-    const decision = String(params.decision) as 'accepted' | 'rejected';
+    const decision = String(params.decision);
+    const kind = String(params.kind ?? 'operator');
+    if (!isValidationDecision(decision)) {
+      return failure(request.id, 400, 'invalid validation decision');
+    }
+    if (!isValidationKind(kind)) {
+      return failure(request.id, 400, 'invalid validation kind');
+    }
+    if (!isAttemptTerminalStatus(attempt.status)) {
+      return failure(request.id, 409, 'attempt is not terminal');
+    }
+    if (decision === 'accepted' && attempt.status !== 'completed') {
+      return failure(request.id, 409, 'only completed attempts can be accepted');
+    }
     this.db.insertValidation({
       validation_id: randomUUID(),
       session_id: task.session_id,
       attempt_id: attemptId,
-      kind: String(params.kind ?? 'operator') as 'inline' | 'operator',
+      kind,
       decision,
       validator_ref: typeof params.validator_ref === 'string' ? params.validator_ref : undefined,
       notes: typeof params.notes === 'string' ? params.notes : undefined,
@@ -339,7 +524,7 @@ export class HarnessController {
       subject_type: 'attempt',
       subject_id: attemptId,
       mutation_id: randomUUID(),
-      payload: { decision, kind: params.kind ?? 'operator' },
+      payload: { decision, kind },
       created_at: now,
     });
     return success(request.id, { ok: true, decision });
@@ -348,10 +533,22 @@ export class HarnessController {
   private updateArtifactStatus(request: JsonRpcRequest): JsonRpcResponse {
     const params = request.params ?? {};
     const artifactId = String(params.artifact_id);
-    const status = String(params.status) as 'promoted' | 'rejected';
+    const status = String(params.status);
+    if (!isArtifactTransition(status)) {
+      return failure(request.id, 400, 'invalid artifact status transition');
+    }
     const artifact = this.db.getArtifact(artifactId);
     if (!artifact) {
       return failure(request.id, 404, 'artifact not found');
+    }
+    if (status === 'promoted') {
+      const inspection = this.inspectArtifactStorage(artifact.session_id, artifact.storage_uri);
+      if ('error' in inspection) {
+        return failure(request.id, 409, inspection.error, inspection.detail);
+      }
+      if (inspection.digest !== artifact.digest || inspection.sizeBytes !== (artifact.size_bytes ?? inspection.sizeBytes)) {
+        return failure(request.id, 409, 'artifact content changed after registration');
+      }
     }
     const updated = this.db.updateArtifactStatus(artifactId, status);
     if (!updated) {
@@ -446,37 +643,46 @@ export class HarnessController {
     if (!task) {
       return failure(request.id, 404, 'task not found');
     }
-    const nextFence = worker.generation;
+    if (!workerSupportsCapabilities(worker.capability_profile, task.required_capabilities)) {
+      return failure(request.id, 409, 'worker capability mismatch');
+    }
+    const activeAttempt = this.db.getCurrentAttemptForWorker(worker.worker_instance_id);
+    if (activeAttempt && ['assigned', 'running', 'blocked'].includes(activeAttempt.status)) {
+      return failure(request.id, 409, 'worker already has active attempt');
+    }
+    const nextFence = this.db.allocateNextAssignmentFence(worker.worker_instance_id);
     const attemptId = String(params.attempt_id);
-    this.db.insertAttempt({
-      attempt_id: attemptId,
-      task_id: taskId,
-      worker_instance_id: worker.worker_instance_id,
-      assignment_fence: nextFence,
-      status: 'assigned',
-      current_activity: 'assigned',
-      progress_counter: 0,
-      started_at: now,
-      last_heartbeat_at: undefined,
-      last_meaningful_change_at: now,
-      completed_at: undefined,
-      error_summary: undefined,
+    this.db.transaction(() => {
+      this.db.insertAttempt({
+        attempt_id: attemptId,
+        task_id: taskId,
+        worker_instance_id: worker.worker_instance_id,
+        assignment_fence: nextFence,
+        status: 'assigned',
+        current_activity: 'assigned',
+        progress_counter: 0,
+        started_at: now,
+        last_heartbeat_at: undefined,
+        last_meaningful_change_at: now,
+        completed_at: undefined,
+        error_summary: undefined,
+      });
+      this.db.updateWorkerActiveAttempt(worker.worker_instance_id, attemptId, now);
+      this.db.updateWorkerBlockedReason(worker.worker_instance_id, null, now);
+      this.db.updateTaskStatus(taskId, 'active', now);
+      this.db.insertEvent({
+        event_id: randomUUID(),
+        session_id: worker.session_id,
+        event_type: 'attempt_assigned',
+        actor: 'controller',
+        subject_type: 'attempt',
+        subject_id: attemptId,
+        mutation_id: randomUUID(),
+        payload: { assignment_fence: nextFence, worker_instance_id: worker.worker_instance_id },
+        created_at: now,
+      });
     });
-    this.db.updateWorkerActiveAttempt(worker.worker_instance_id, attemptId, now);
-    this.db.updateWorkerBlockedReason(worker.worker_instance_id, null, now);
-    this.db.updateTaskStatus(taskId, 'active', now);
     this.writeWorkerPacket(worker.session_id, worker.worker_instance_id, worker.generation, worker.role_label, worker.memory_ref ?? null);
-    this.db.insertEvent({
-      event_id: randomUUID(),
-      session_id: worker.session_id,
-      event_type: 'attempt_assigned',
-      actor: 'controller',
-      subject_type: 'attempt',
-      subject_id: attemptId,
-      mutation_id: randomUUID(),
-      payload: { assignment_fence: nextFence, worker_instance_id: worker.worker_instance_id },
-      created_at: now,
-    });
     return success(request.id, { attempt_id: attemptId, assignment_fence: nextFence });
   }
 
@@ -495,43 +701,55 @@ export class HarnessController {
     }
 
     const commandId = randomUUID();
-    this.db.insertControllerCommand({
-      command_id: commandId,
-      session_id: worker.session_id,
-      kind: 'cancel_attempt',
-      status: 'pending',
-      step_state: 'cancel_requested',
-      payload: { attempt_id: attemptId, worker_instance_id: worker.worker_instance_id },
-      created_at: now,
-      updated_at: now,
+    this.db.transaction(() => {
+      this.db.insertControllerCommand({
+        command_id: commandId,
+        session_id: worker.session_id,
+        kind: 'cancel_attempt',
+        status: 'pending',
+        step_state: 'cancel_requested',
+        payload: { attempt_id: attemptId, worker_instance_id: worker.worker_instance_id },
+        created_at: now,
+        updated_at: now,
+      });
     });
 
     if (worker.runtime_handle) {
-      await this.supervisor.terminateWorker({ runtimeHandle: worker.runtime_handle });
+      const terminated = await this.supervisor.terminateWorker({ runtimeHandle: worker.runtime_handle });
+      if (!terminated) {
+        this.db.updateControllerCommand(commandId, 'acked', 'terminate_unconfirmed', now);
+        return failure(request.id, 503, 'worker terminate not confirmed');
+      }
     }
 
-    const cancelled = this.db.completeAttempt(attemptId, attempt.assignment_fence, 'cancelled', 'cancelled by admin', now);
-    if (!cancelled) {
+    const nextGeneration = this.db.transaction(() => {
+      const cancelled = this.db.completeAttempt(attemptId, attempt.assignment_fence, 'cancelled', 'cancelled by admin', now);
+      if (!cancelled) {
+        return null;
+      }
+      const generation = this.db.advanceWorkerGeneration(worker.worker_instance_id, null, now);
+      this.rotateWorkerToken(this.resolveAuthorityRoot(worker.session_id), worker.worker_instance_id);
+      this.db.bindWorkerRuntime(worker.worker_instance_id, null, 'killed', now);
+      this.db.updateWorkerActiveAttempt(worker.worker_instance_id, null, now);
+      this.db.updateWorkerBlockedReason(worker.worker_instance_id, null, now);
+      this.db.updateControllerCommand(commandId, 'applied', 'cleanup_done', now);
+      this.db.insertEvent({
+        event_id: randomUUID(),
+        session_id: worker.session_id,
+        event_type: 'attempt_cancelled',
+        actor: 'admin',
+        subject_type: 'attempt',
+        subject_id: attemptId,
+        mutation_id: randomUUID(),
+        payload: { worker_instance_id: worker.worker_instance_id, next_generation: generation },
+        created_at: now,
+      });
+      return generation;
+    });
+    if (nextGeneration === null) {
       this.db.updateControllerCommand(commandId, 'aborted', 'fence_rejected', now);
       return failure(request.id, 409, 'fence rejected');
     }
-
-    const nextGeneration = this.db.advanceWorkerGeneration(worker.worker_instance_id, null, now);
-    this.db.bindWorkerRuntime(worker.worker_instance_id, null, 'killed', now);
-    this.db.updateWorkerActiveAttempt(worker.worker_instance_id, null, now);
-    this.db.updateWorkerBlockedReason(worker.worker_instance_id, null, now);
-    this.db.updateControllerCommand(commandId, 'applied', 'cleanup_done', now);
-    this.db.insertEvent({
-      event_id: randomUUID(),
-      session_id: worker.session_id,
-      event_type: 'attempt_cancelled',
-      actor: 'admin',
-      subject_type: 'attempt',
-      subject_id: attemptId,
-      mutation_id: randomUUID(),
-      payload: { worker_instance_id: worker.worker_instance_id, next_generation: nextGeneration },
-      created_at: now,
-    });
     return success(request.id, { ok: true, next_generation: nextGeneration });
   }
 
@@ -543,61 +761,90 @@ export class HarnessController {
       return failure(request.id, 404, 'worker instance not found');
     }
 
-    const nextGeneration = this.db.advanceWorkerGeneration(worker.worker_instance_id, null, now);
+    const commandId = randomUUID();
     const activeAttempt = this.db.getCurrentAttemptForWorker(worker.worker_instance_id);
-    if (activeAttempt) {
-      this.db.reassignAttemptFence(activeAttempt.attempt_id, nextGeneration, now);
+    const nextGeneration = this.db.transaction(() => {
+      const generation = this.db.advanceWorkerGeneration(worker.worker_instance_id, null, now);
+      if (activeAttempt) {
+        const nextFence = this.db.allocateNextAssignmentFence(worker.worker_instance_id);
+        this.db.reassignAttemptFence(activeAttempt.attempt_id, nextFence, now);
+      }
+      this.db.insertControllerCommand({
+        command_id: commandId,
+        session_id: worker.session_id,
+        kind: 'recycle_worker_session',
+        status: 'pending',
+        step_state: 'recycle_requested',
+        payload: {
+          worker_instance_id: worker.worker_instance_id,
+          previous_runtime_handle: worker.runtime_handle ?? null,
+          next_generation: generation,
+          active_attempt_id: activeAttempt?.attempt_id ?? null,
+        },
+        created_at: now,
+        updated_at: now,
+      });
+      return generation;
+    });
+
+    let handle;
+    try {
+      handle = await this.supervisor.recycleWorker(
+        {
+          sessionId: worker.session_id,
+          workerInstanceId: worker.worker_instance_id,
+          roleLabel: worker.role_label,
+          generation: nextGeneration,
+          authorityRoot: this.resolveAuthorityRoot(worker.session_id),
+          workingDir: process.env.HARNESS_WORKER_CWD ?? process.cwd(),
+          cliPath: process.env.HARNESS_CLI_PATH ?? DEFAULT_CLI_PATH,
+          memoryRef: worker.memory_ref,
+          capabilityProfile: worker.capability_profile,
+          workerTokenPath: this.rotateWorkerToken(this.resolveAuthorityRoot(worker.session_id), worker.worker_instance_id),
+        },
+        worker.runtime_handle,
+      );
+    } catch (error) {
+      this.db.transaction(() => {
+        this.db.bindWorkerRuntime(worker.worker_instance_id, null, 'exited', now);
+        this.db.updateWorkerBlockedReason(worker.worker_instance_id, null, now);
+        this.db.updateControllerCommand(commandId, 'aborted', 'recycle_failed', now);
+        this.db.insertEvent({
+          event_id: randomUUID(),
+          session_id: worker.session_id,
+          event_type: 'worker_recycle_failed',
+          actor: 'controller',
+          subject_type: 'worker_instance',
+          subject_id: worker.worker_instance_id,
+          mutation_id: randomUUID(),
+          payload: { error: String(error) },
+          created_at: now,
+        });
+      });
+      return failure(request.id, 500, 'worker recycle failed', String(error));
     }
 
-    const commandId = randomUUID();
-    this.db.insertControllerCommand({
-      command_id: commandId,
-      session_id: worker.session_id,
-      kind: 'recycle_worker_session',
-      status: 'pending',
-      step_state: 'recycle_requested',
-      payload: {
-        worker_instance_id: worker.worker_instance_id,
-        previous_runtime_handle: worker.runtime_handle ?? null,
-        next_generation: nextGeneration,
-      },
-      created_at: now,
-      updated_at: now,
+    this.db.transaction(() => {
+      this.db.bindWorkerRuntime(worker.worker_instance_id, handle.runtimeHandle, 'started', now);
+      this.db.updateWorkerBlockedReason(worker.worker_instance_id, null, now);
+      this.db.updateControllerCommand(commandId, 'applied', 'started', now);
+      this.db.insertEvent({
+        event_id: randomUUID(),
+        session_id: worker.session_id,
+        event_type: 'worker_session_recycled',
+        actor: 'controller',
+        subject_type: 'worker_instance',
+        subject_id: worker.worker_instance_id,
+        mutation_id: randomUUID(),
+        payload: {
+          runtime_handle: handle.runtimeHandle,
+          generation: nextGeneration,
+          active_attempt_id: activeAttempt?.attempt_id ?? null,
+        },
+        created_at: now,
+      });
     });
-
-    const handle = await this.supervisor.recycleWorker(
-      {
-        sessionId: worker.session_id,
-        workerInstanceId: worker.worker_instance_id,
-        roleLabel: worker.role_label,
-        generation: nextGeneration,
-        authorityRoot: this.resolveAuthorityRoot(worker.session_id),
-        workingDir: process.env.HARNESS_WORKER_CWD ?? process.cwd(),
-        cliPath: process.env.HARNESS_CLI_PATH ?? DEFAULT_CLI_PATH,
-        memoryRef: worker.memory_ref,
-      },
-      worker.runtime_handle,
-    );
-
-    this.db.bindWorkerRuntime(worker.worker_instance_id, handle.runtimeHandle, 'started', now);
-    this.db.updateWorkerBlockedReason(worker.worker_instance_id, null, now);
-    this.db.updateControllerCommand(commandId, 'applied', 'started', now);
     this.writeWorkerPacket(worker.session_id, worker.worker_instance_id, nextGeneration, worker.role_label, worker.memory_ref ?? null);
-    this.db.insertEvent({
-      event_id: randomUUID(),
-      session_id: worker.session_id,
-      event_type: 'worker_session_recycled',
-      actor: 'controller',
-      subject_type: 'worker_instance',
-      subject_id: worker.worker_instance_id,
-      mutation_id: randomUUID(),
-      payload: {
-        runtime_handle: handle.runtimeHandle,
-        generation: nextGeneration,
-        active_attempt_id: activeAttempt?.attempt_id ?? null,
-      },
-      created_at: now,
-    });
     return success(request.id, handle);
   }
 
@@ -611,8 +858,9 @@ export class HarnessController {
       String(params.activity),
       Number(params.progress_counter),
       now,
+      Boolean(params.liveness_only),
     );
-    if (ok) {
+    if (ok && !Boolean(params.liveness_only)) {
       const attempt = this.db.getAttempt(attemptId);
       if (attempt) {
         this.db.updateWorkerBlockedReason(attempt.worker_instance_id, null, now);
@@ -662,13 +910,32 @@ export class HarnessController {
     if (!worker || worker.generation !== generation) {
       return failure(request.id, 409, 'generation rejected');
     }
-    const messages = this.db.listPendingMessages(workerInstanceId);
     const now = new Date().toISOString();
-    this.db.markMessagesDelivered(
-      messages.map((message) => message.message_id),
-      now,
-    );
+    const leaseExpiresAt = new Date(Date.now() + 30_000).toISOString();
+    const messages = this.db.leaseMessages(workerInstanceId, now, leaseExpiresAt);
     return success(request.id, { messages });
+  }
+
+  private ackMessages(request: JsonRpcRequest): JsonRpcResponse {
+    const params = request.params ?? {};
+    const workerInstanceId = String(params.worker_instance_id);
+    const generation = Number(params.generation ?? 0);
+    const worker = this.db.getWorker(workerInstanceId);
+    if (!worker || worker.generation !== generation) {
+      return failure(request.id, 409, 'generation rejected');
+    }
+    const acks = Array.isArray(params.acks)
+      ? params.acks
+        .filter((ack): ack is { message_id: string; lease_token: string } => {
+          return !!ack
+            && typeof ack === 'object'
+            && typeof (ack as { message_id?: unknown }).message_id === 'string'
+            && typeof (ack as { lease_token?: unknown }).lease_token === 'string';
+        })
+        .map((ack) => ({ message_id: ack.message_id, lease_token: ack.lease_token }))
+      : [];
+    const delivered = this.db.ackMessages(acks, new Date().toISOString());
+    return success(request.id, { ok: true, delivered });
   }
 
   private sendWorkerMessage(request: JsonRpcRequest): JsonRpcResponse {
@@ -709,15 +976,22 @@ export class HarnessController {
     if (!worker) {
       return failure(request.id, 404, 'worker instance not found');
     }
+    const inspection = this.inspectArtifactStorage(worker.session_id, String(params.storage_uri));
+    if ('error' in inspection) {
+      return failure(request.id, 400, inspection.error, inspection.detail);
+    }
+    if (params.digest && String(params.digest) !== inspection.digest) {
+      return failure(request.id, 400, 'artifact digest mismatch');
+    }
     this.db.insertArtifact({
       artifact_id: String(params.artifact_id),
       session_id: worker.session_id,
       attempt_id: attemptId,
       worker_instance_id: worker.worker_instance_id,
       kind: String(params.kind),
-      storage_uri: String(params.storage_uri),
-      digest: String(params.digest),
-      size_bytes: typeof params.size_bytes === 'number' ? params.size_bytes : undefined,
+      storage_uri: inspection.storageUri,
+      digest: inspection.digest,
+      size_bytes: inspection.sizeBytes,
       metadata: params.metadata ?? null,
       status: 'sealed',
       created_at: now,
@@ -741,24 +1015,30 @@ export class HarnessController {
     const now = new Date().toISOString();
     const attemptId = String(params.attempt_id);
     const fence = Number(params.assignment_fence);
-    const status = String(params.status) as 'completed' | 'failed' | 'cancelled';
-    const ok = this.db.completeAttempt(
-      attemptId,
-      fence,
-      status,
-      typeof params.error_summary === 'string' ? params.error_summary : null,
-      now,
-    );
-    if (!ok) {
-      return failure(request.id, 409, 'fence rejected');
+    const status = String(params.status);
+    if (!isAttemptTerminalStatus(status)) {
+      return failure(request.id, 400, 'invalid attempt completion status');
     }
     const attempt = this.db.getAttempt(attemptId);
-    if (attempt) {
+    if (!attempt) {
+      return failure(request.id, 404, 'attempt not found');
+    }
+    const worker = this.db.getWorker(attempt.worker_instance_id);
+    const task = this.db.getTask(attempt.task_id);
+    const ok = this.db.transaction(() => {
+      const completed = this.db.completeAttempt(
+        attemptId,
+        fence,
+        status,
+        typeof params.error_summary === 'string' ? params.error_summary : null,
+        now,
+      );
+      if (!completed) {
+        return false;
+      }
       this.db.updateWorkerActiveAttempt(attempt.worker_instance_id, null, now);
       this.db.updateWorkerBlockedReason(attempt.worker_instance_id, null, now);
       this.db.updateTaskStatus(attempt.task_id, status === 'completed' ? 'provisional' : 'active', now);
-      const worker = this.db.getWorker(attempt.worker_instance_id);
-      const task = this.db.getTask(attempt.task_id);
       if (task) {
         this.db.insertEvent({
           event_id: randomUUID(),
@@ -772,6 +1052,10 @@ export class HarnessController {
           created_at: now,
         });
       }
+      return true;
+    });
+    if (!ok) {
+      return failure(request.id, 409, 'fence rejected');
     }
     return success(request.id, { ok: true });
   }
@@ -801,6 +1085,117 @@ export class HarnessController {
     return dirname(this.paths.dbPath);
   }
 
+  private authDir(authorityRoot: string): string {
+    return join(authorityRoot, 'runtime', 'auth');
+  }
+
+  private adminTokenPath(authorityRoot: string): string {
+    return join(this.authDir(authorityRoot), 'admin.token');
+  }
+
+  private workerTokenPath(authorityRoot: string, workerInstanceId: string): string {
+    return join(this.authDir(authorityRoot), `${workerInstanceId}.token`);
+  }
+
+  private ensureAdminToken(authorityRoot: string): string {
+    const tokenPath = this.adminTokenPath(authorityRoot);
+    mkdirSync(dirname(tokenPath), { recursive: true });
+    if (!existsSync(tokenPath)) {
+      writeFileSync(tokenPath, `${randomUUID()}\n`, { mode: 0o600 });
+    }
+    return readFileSync(tokenPath, 'utf8').trim();
+  }
+
+  private ensureWorkerToken(authorityRoot: string, workerInstanceId: string): string {
+    const tokenPath = this.workerTokenPath(authorityRoot, workerInstanceId);
+    mkdirSync(dirname(tokenPath), { recursive: true });
+    if (!existsSync(tokenPath)) {
+      writeFileSync(tokenPath, `${randomUUID()}\n`, { mode: 0o600 });
+    }
+    return tokenPath;
+  }
+
+  private rotateWorkerToken(authorityRoot: string, workerInstanceId: string): string {
+    const tokenPath = this.workerTokenPath(authorityRoot, workerInstanceId);
+    mkdirSync(dirname(tokenPath), { recursive: true });
+    writeFileSync(tokenPath, `${randomUUID()}\n`, { mode: 0o600 });
+    return tokenPath;
+  }
+
+  private authorizeAdminRequest(request: JsonRpcRequest): JsonRpcResponse | null {
+    const provided = typeof request.params?.auth_token === 'string' ? request.params.auth_token : '';
+    if (!provided) {
+      return failure(request.id, 401, 'missing admin auth token');
+    }
+    const expected = this.ensureAdminToken(dirname(this.paths.dbPath));
+    if (provided !== expected) {
+      return failure(request.id, 403, 'invalid admin auth token');
+    }
+    return null;
+  }
+
+  private authorizeWorkerRequest(request: JsonRpcRequest): JsonRpcResponse | null {
+    const provided = typeof request.params?.auth_token === 'string' ? request.params.auth_token : '';
+    if (!provided) {
+      return failure(request.id, 401, 'missing worker auth token');
+    }
+    const params = request.params ?? {};
+    let worker: WorkerInstanceRecord | undefined;
+    if (typeof params.worker_instance_id === 'string') {
+      worker = this.db.getWorker(params.worker_instance_id);
+    } else if (typeof params.attempt_id === 'string') {
+      const attempt = this.db.getAttempt(params.attempt_id);
+      if (!attempt) {
+        return failure(request.id, 404, 'attempt not found');
+      }
+      worker = this.db.getWorker(attempt.worker_instance_id);
+    }
+    if (!worker) {
+      return failure(request.id, 404, 'worker instance not found');
+    }
+    const tokenPath = this.workerTokenPath(this.resolveAuthorityRoot(worker.session_id), worker.worker_instance_id);
+    if (!existsSync(tokenPath)) {
+      return failure(request.id, 403, 'worker auth token missing');
+    }
+    const expected = readFileSync(tokenPath, 'utf8').trim();
+    if (provided !== expected) {
+      return failure(request.id, 403, 'invalid worker auth token');
+    }
+    return null;
+  }
+
+  private inspectArtifactStorage(
+    sessionId: string,
+    storageUri: string,
+  ): ArtifactStorageInspection | { error: string; detail?: string } {
+    const authorityRoot = this.resolveAuthorityRoot(sessionId);
+    const artifactRoot = join(authorityRoot, 'artifacts');
+    let resolvedPath: string;
+    try {
+      resolvedPath = fileURLToPath(storageUri);
+    } catch (error) {
+      return { error: 'artifact storage_uri must be a valid file:// URI', detail: String(error) };
+    }
+    if (!isPathWithin(artifactRoot, resolvedPath)) {
+      return { error: 'artifact storage path must stay within the authority artifact root' };
+    }
+    try {
+      const canonicalPath = realpathSync.native(resolve(resolvedPath));
+      const artifactStat = statSync(canonicalPath);
+      if (!artifactStat.isFile()) {
+        return { error: 'artifact file must be a regular file' };
+      }
+      const content = readFileSync(canonicalPath);
+      return {
+        storageUri: pathToFileURL(canonicalPath).href,
+        digest: createHash('sha256').update(content).digest('hex'),
+        sizeBytes: artifactStat.size,
+      };
+    } catch (error) {
+      return { error: 'artifact file is unreadable', detail: String(error) };
+    }
+  }
+
   private writeRehydrationPacket(sessionId: string, workerInstanceId: string, packet: unknown): void {
     const authorityRoot = this.resolveAuthorityRoot(sessionId);
     const dir = join(authorityRoot, 'rehydration');
@@ -826,7 +1221,13 @@ export class HarnessController {
       worker_generation: workerGeneration,
       role_label: roleLabel,
       memory_ref: memoryRef,
-      memory,
+      memory: {
+        ref: memory.ref,
+        path: memory.path,
+        exists: memory.exists,
+        bytes: memory.bytes,
+        excerpt: memory.excerpt,
+      },
       active_attempt: activeAttempt && task
         ? {
             attempt_id: activeAttempt.attempt_id,
@@ -861,6 +1262,8 @@ export class HarnessController {
           workingDir: process.env.HARNESS_WORKER_CWD ?? process.cwd(),
           cliPath: process.env.HARNESS_CLI_PATH ?? DEFAULT_CLI_PATH,
           memoryRef: worker.memory_ref,
+          capabilityProfile: worker.capability_profile,
+          workerTokenPath: this.ensureWorkerToken(this.resolveAuthorityRoot(worker.session_id), worker.worker_instance_id),
         },
         worker.runtime_handle,
       );
@@ -991,6 +1394,8 @@ export class HarnessController {
         workingDir: process.env.HARNESS_WORKER_CWD ?? process.cwd(),
         cliPath: process.env.HARNESS_CLI_PATH ?? DEFAULT_CLI_PATH,
         memoryRef: worker.memory_ref,
+        capabilityProfile: worker.capability_profile,
+        workerTokenPath: this.rotateWorkerToken(this.resolveAuthorityRoot(worker.session_id), worker.worker_instance_id),
       },
       worker.runtime_handle,
     );

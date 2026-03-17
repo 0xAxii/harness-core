@@ -12,9 +12,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node ./dist/cli/index.js",
     "dev": "node --enable-source-maps ./dist/cli/index.js",
+    "smoke:assignment-fence": "node ./scripts/assignment-fence-smoke.mjs",
+    "smoke:auth": "node ./scripts/auth-smoke.mjs",
     "smoke:multi-worker": "node ./scripts/multi-worker-smoke.mjs",
     "smoke:restart-reconcile": "node ./scripts/restart-reconcile-smoke.mjs",
-    "smoke:cancel-replay": "node ./scripts/cancel-replay-smoke.mjs"
+    "smoke:cancel-replay": "node ./scripts/cancel-replay-smoke.mjs",
+    "smoke:gate-fix": "node ./scripts/gate-fix-smoke.mjs"
   },
   "engines": {
     "node": ">=20"

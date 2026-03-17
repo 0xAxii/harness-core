@@ -46,12 +46,17 @@ Build and verify in this order:
 - detached tmux session per live worker session in the current adapter
 - controller restart reconciles surviving tmux runtimes and reattaches runtime sidecars
 - controller restart also settles pending `launch_worker` / `cancel_attempt` / `recycle_worker_session` commands through conservative replay or reconcile
+- launch failure settles `launch_worker` as `aborted/launch_failed` instead of leaving a zombie pending command
 - worker bootstrap prompt generated into `runtime/*.prompt.txt`
 - current adapter auto-dismisses the Codex workspace trust prompt
+- admin and worker RPC calls require auth tokens carried by the CLI wrapper
 - mailbox sidecar writes `runtime/mailbox/<worker>.json`
+- mailbox delivery uses `poll_messages -> leased` followed by `ack_messages -> delivered`
 - sidecar heartbeat writes `runtime/heartbeat/<worker>.json`
 - worker memory lives under `memory/<worker>.md` by default and is embedded into the rehydration packet as an excerpt
 - workers can explicitly enter `blocked` state and clear it by sending a later heartbeat
+- assignment checks task `required_capabilities` against the worker capability profile before creating a new attempt
+- worker launch validates and normalizes `capability_profile` before persisting it and mapping it into runtime env
 
 ## Tier 0 tables
 

@@ -9,6 +9,7 @@ export interface WorkerHeartbeatParams {
   assignment_fence: number;
   activity: string;
   progress_counter: number;
+  liveness_only?: boolean;
 }
 
 export interface WorkerCompleteParams {
@@ -21,6 +22,15 @@ export interface WorkerCompleteParams {
 export interface WorkerPollParams {
   worker_instance_id: string;
   generation: number;
+}
+
+export interface WorkerAckMessagesParams {
+  worker_instance_id: string;
+  generation: number;
+  acks: Array<{
+    message_id: string;
+    lease_token: string;
+  }>;
 }
 
 export interface WorkerSendMessageParams {
@@ -47,6 +57,7 @@ export type WorkerMethod =
   | 'heartbeat'
   | 'complete_attempt'
   | 'poll_messages'
+  | 'ack_messages'
   | 'send_message'
   | 'register_artifact'
   | 'report_blocked';

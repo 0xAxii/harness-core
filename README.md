@@ -54,9 +54,12 @@ Useful admin memory methods:
 - `harness admin show-packet <session-id> <worker-instance-id>`
 
 Smoke scripts:
+- `npm run smoke:auth`
+- `npm run smoke:assignment-fence`
 - `npm run smoke:multi-worker`
 - `npm run smoke:restart-reconcile`
 - `npm run smoke:cancel-replay`
+- `npm run smoke:gate-fix`
 
 ## Status
 
@@ -74,6 +77,8 @@ Currently verified:
 - write rehydration packet on assignment
 - task status moves to `active` on assignment
 - admin-to-worker message enqueue and worker poll delivery
+- admin / worker socket auth token enforcement
+- leased mailbox delivery with explicit ack
 - worker mailbox + heartbeat sidecar snapshots
 - worker blocked state and blocked_reason tracking
 - worker artifact registration
@@ -83,6 +88,11 @@ Currently verified:
 - cancel attempt
 - recycle live session while keeping worker identity
 - fallback sidecar heartbeat across worker recycle
+- sequential assignment gate for active worker attempts
+- launch failure settles controller state cleanly instead of leaving pending zombie commands
+- assignment capability mismatch rejected before attempt creation
+- capability profile payload validation at worker launch
+- liveness-only sidecar heartbeat that preserves worker-owned progress/activity
 - controller restart reconciles surviving tmux workers and restarts their runtime sidecars
 - controller restart replays pending `recycle_worker_session` commands and settles them as `reconciled`
 - stale completion rejected by fence/state checks

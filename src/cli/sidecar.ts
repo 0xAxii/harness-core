@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { JsonRpcFailure } from '../protocol/jsonrpc.js';
-import { callSocket, resolveAuthorityRoot } from './client.js';
+import { resolveAuthorityRoot } from './client.js';
+import { callWorkerTransport } from './worker-transport.js';
 
 interface SidecarMailboxPayload {
   messages?: Array<{ message_id?: string } & Record<string, unknown>>;
@@ -12,8 +13,6 @@ interface SidecarPacket {
   active_attempt?: {
     attempt_id?: string;
     assignment_fence?: number;
-    current_activity?: string;
-    progress_counter?: number;
   } | null;
 }
 
@@ -66,6 +65,10 @@ export async function runSidecarCommand(args: string[]): Promise<void> {
       )}\n`,
       'utf8',
     );
+    const ackResult = await ackMessages(sessionId, workerInstanceId, generation, pollResult.messages);
+    if (ackResult.exit) {
+      return;
+    }
 
     writeFileSync(
       heartbeatPath,
@@ -90,10 +93,8 @@ export async function runSidecarCommand(args: string[]): Promise<void> {
 }
 
 async function pollMessages(sessionId: string, workerInstanceId: string, generation: number): Promise<{ exit: boolean; messages: unknown[] }> {
-  const authorityRoot = resolveAuthorityRoot(sessionId);
-  const socketPath = join(authorityRoot, 'worker.sock');
   try {
-    const response = await callSocket(socketPath, 'poll_messages', {
+    const response = await callWorkerTransport(sessionId, 'poll_messages', {
       worker_instance_id: workerInstanceId,
       generation,
     });
@@ -111,6 +112,36 @@ async function pollMessages(sessionId: string, workerInstanceId: string, generat
   }
 }
 
+async function ackMessages(sessionId: string, workerInstanceId: string, generation: number, messages: unknown[]): Promise<{ exit: boolean }> {
+  const acks = messages
+    .filter((message): message is { message_id: string; lease_token: string } & Record<string, unknown> => {
+      return !!message
+        && typeof message === 'object'
+        && typeof (message as { message_id?: unknown }).message_id === 'string'
+        && typeof (message as { lease_token?: unknown }).lease_token === 'string';
+    })
+    .map((message) => ({ message_id: message.message_id, lease_token: message.lease_token }));
+  if (acks.length === 0) {
+    return { exit: false };
+  }
+  try {
+    const response = await callWorkerTransport(sessionId, 'ack_messages', {
+      worker_instance_id: workerInstanceId,
+      generation,
+      acks,
+    });
+    if ('error' in response) {
+      const failure = response as JsonRpcFailure;
+      if (failure.error.code === 409) {
+        return { exit: true };
+      }
+    }
+    return { exit: false };
+  } catch {
+    return { exit: false };
+  }
+}
+
 async function sendHeartbeat(
   sessionId: string,
   workerInstanceId: string,
@@ -125,14 +156,13 @@ async function sendHeartbeat(
     return { exit: true, status: 'generation_rejected' };
   }
 
-  const authorityRoot = resolveAuthorityRoot(sessionId);
-  const socketPath = join(authorityRoot, 'worker.sock');
   try {
-    const response = await callSocket(socketPath, 'heartbeat', {
+    const response = await callWorkerTransport(sessionId, 'heartbeat', {
       attempt_id: activeAttempt.attempt_id,
       assignment_fence: activeAttempt.assignment_fence,
-      activity: activeAttempt.current_activity ?? 'sidecar-watchdog',
-      progress_counter: typeof activeAttempt.progress_counter === 'number' ? activeAttempt.progress_counter : 0,
+      activity: 'sidecar-watchdog',
+      progress_counter: 0,
+      liveness_only: true,
     });
     if ('error' in response) {
       const failure = response as JsonRpcFailure;

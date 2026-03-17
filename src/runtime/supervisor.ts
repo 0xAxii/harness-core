@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { writeWorkerBootstrapScript } from './worker-bootstrap.js';
 import { resolveWorkerMemoryPath } from './memory.js';
+import type { CapabilityProfile } from '../types/model.js';
 
 export interface LiveSessionHandle {
   runtimeHandle: string;
@@ -19,6 +20,8 @@ export interface LaunchWorkerOptions {
   workingDir: string;
   cliPath: string;
   memoryRef?: string;
+  capabilityProfile: CapabilityProfile;
+  workerTokenPath: string;
 }
 
 export interface TerminateWorkerOptions {
@@ -53,6 +56,7 @@ export class EmbeddedSupervisor {
         cliPath: options.cliPath,
         memoryRef: options.memoryRef,
         memoryPath,
+        capabilityProfile: options.capabilityProfile,
       });
     execFileSync(
       'tmux',
@@ -83,6 +87,18 @@ export class EmbeddedSupervisor {
         `HARNESS_REHYDRATION_PACKET=${join(options.authorityRoot, 'rehydration', `${options.workerInstanceId}.json`)}`,
         '-e',
         `HARNESS_CLI_PATH=${options.cliPath}`,
+        '-e',
+        `HARNESS_WORKER_TOKEN_FILE=${options.workerTokenPath}`,
+        '-e',
+        `HARNESS_CAPABILITY_PROFILE=${JSON.stringify(options.capabilityProfile)}`,
+        '-e',
+        `HARNESS_NETWORK_PROFILE=${options.capabilityProfile.network_profile}`,
+        '-e',
+        `HARNESS_BROWSER_ACCESS=${options.capabilityProfile.browser_access ? '1' : '0'}`,
+        '-e',
+        `HARNESS_PUBLISH_RIGHT=${options.capabilityProfile.publish_right ? '1' : '0'}`,
+        '-e',
+        `HARNESS_CODEX_SANDBOX=${process.env.HARNESS_CODEX_SANDBOX ?? defaultSandboxMode(options.capabilityProfile)}`,
         typeof process.env.HARNESS_WORKER_COMMAND === 'string' ? launchScript : `bash ${launchScript}`,
       ],
       { stdio: 'ignore' },
@@ -171,7 +187,7 @@ function killTmuxSession(sessionName: string): boolean {
 
 function launchWorkerRuntimeSidecar(options: LaunchWorkerOptions): number | undefined {
   killTrackedSidecarPid(options.authorityRoot, options.workerInstanceId);
-  const child = spawn(
+    const child = spawn(
     process.execPath,
     [
       options.cliPath,
@@ -188,6 +204,8 @@ function launchWorkerRuntimeSidecar(options: LaunchWorkerOptions): number | unde
       env: {
         ...process.env,
         XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+        HARNESS_WORKER_TOKEN_FILE: options.workerTokenPath,
+        HARNESS_CAPABILITY_PROFILE: JSON.stringify(options.capabilityProfile),
       },
       stdio: 'ignore',
       detached: true,
@@ -276,4 +294,8 @@ function dismissTrustPromptIfPresent(sessionName: string): void {
     }
     execFileSync('sleep', ['0.2'], { stdio: 'ignore' });
   }
+}
+
+function defaultSandboxMode(capabilityProfile: CapabilityProfile): string {
+  return capabilityProfile.publish_right ? 'workspace-write' : 'read-only';
 }

@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +40,10 @@ export class HarnessDatabase {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
     this.db.exec(readFileSync(SCHEMA_PATH, 'utf8'));
+  }
+
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
   }
 
   createSession(record: SessionRecord): void {
@@ -158,10 +163,10 @@ export class HarnessDatabase {
       .prepare(
         `INSERT INTO messages (
           message_id, session_id, from_worker_instance_id, to_worker_instance_id, attempt_id,
-          kind, payload, status, created_at, delivered_at, expires_at
+          kind, payload, status, lease_token, leased_at, lease_expires_at, created_at, delivered_at, expires_at
         ) VALUES (
           @message_id, @session_id, @from_worker_instance_id, @to_worker_instance_id, @attempt_id,
-          @kind, @payload, @status, @created_at, @delivered_at, @expires_at
+          @kind, @payload, @status, @lease_token, @leased_at, @lease_expires_at, @created_at, @delivered_at, @expires_at
         )`,
       )
       .run({
@@ -170,6 +175,9 @@ export class HarnessDatabase {
         to_worker_instance_id: record.to_worker_instance_id ?? null,
         attempt_id: record.attempt_id ?? null,
         payload: stringify(record.payload),
+        lease_token: record.lease_token ?? null,
+        leased_at: record.leased_at ?? null,
+        lease_expires_at: record.lease_expires_at ?? null,
         delivered_at: record.delivered_at ?? null,
         expires_at: record.expires_at ?? null,
       });
@@ -291,29 +299,62 @@ export class HarnessDatabase {
       .all(sessionId) as AttemptRecord[];
   }
 
-  listPendingMessages(workerInstanceId: string): MessageRecord[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM messages
-         WHERE to_worker_instance_id = ? AND status = 'pending'
-         ORDER BY created_at ASC`,
-      )
-      .all(workerInstanceId) as Record<string, unknown>[];
-    return rows.map(decodeMessage);
+  leaseMessages(workerInstanceId: string, leasedAt: string, leaseExpiresAt: string): MessageRecord[] {
+    return this.transaction(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM messages
+           WHERE to_worker_instance_id = ?
+             AND (
+               status = 'pending'
+               OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+             )
+           ORDER BY created_at ASC`,
+        )
+        .all(workerInstanceId, leasedAt) as Record<string, unknown>[];
+      const update = this.db.prepare(
+        `UPDATE messages
+         SET status = 'leased',
+             lease_token = ?,
+             leased_at = ?,
+             lease_expires_at = ?
+         WHERE message_id = ?`,
+      );
+      return rows.map((row) => {
+        const decoded = decodeMessage(row);
+        const leaseToken = randomUUID();
+        update.run(leaseToken, leasedAt, leaseExpiresAt, decoded.message_id);
+        return {
+          ...decoded,
+          status: 'leased' as const,
+          lease_token: leaseToken,
+          leased_at: leasedAt,
+          lease_expires_at: leaseExpiresAt,
+        };
+      });
+    });
   }
 
-  markMessagesDelivered(messageIds: string[], deliveredAt: string): void {
-    if (messageIds.length === 0) {
-      return;
+  ackMessages(acks: Array<{ message_id: string; lease_token: string }>, deliveredAt: string): number {
+    if (acks.length === 0) {
+      return 0;
     }
-    const placeholders = messageIds.map(() => '?').join(', ');
-    this.db
-      .prepare(
+    return this.transaction(() => {
+      const update = this.db.prepare(
         `UPDATE messages
-         SET status = 'delivered', delivered_at = ?
-         WHERE message_id IN (${placeholders})`,
-      )
-      .run(deliveredAt, ...messageIds);
+         SET status = 'delivered',
+             delivered_at = ?,
+             lease_token = NULL,
+             leased_at = NULL,
+             lease_expires_at = NULL
+         WHERE message_id = ? AND status = 'leased' AND lease_token = ?`,
+      );
+      let changed = 0;
+      for (const ack of acks) {
+        changed += Number(update.run(deliveredAt, ack.message_id, ack.lease_token).changes);
+      }
+      return changed;
+    });
   }
 
   listSessionArtifacts(sessionId: string): ArtifactRecord[] {
@@ -332,10 +373,21 @@ export class HarnessDatabase {
       .prepare(
         `UPDATE artifacts
          SET status = ?
-         WHERE artifact_id = ?`,
+         WHERE artifact_id = ? AND status = 'sealed'`,
       )
       .run(status, artifactId);
     return result.changes === 1;
+  }
+
+  allocateNextAssignmentFence(workerInstanceId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(assignment_fence), 0) AS max_fence
+         FROM attempts
+         WHERE worker_instance_id = ?`,
+      )
+      .get(workerInstanceId) as { max_fence: number };
+    return Number(row.max_fence ?? 0) + 1;
   }
 
   listSessionValidations(sessionId: string): ValidationRecord[] {
@@ -430,24 +482,52 @@ export class HarnessDatabase {
       .run(runtimeHandle, supervisorState, updatedAt, workerInstanceId);
   }
 
-  updateAttemptHeartbeat(attemptId: string, expectedFence: number, activity: string, progressCounter: number, now: string): boolean {
+  updateAttemptHeartbeat(
+    attemptId: string,
+    expectedFence: number,
+    activity: string,
+    progressCounter: number,
+    now: string,
+    livenessOnly = false,
+  ): boolean {
     const result = this.db
       .prepare(
         `UPDATE attempts
-         SET current_activity = ?,
-             progress_counter = ?,
+         SET current_activity = CASE
+               WHEN ? THEN current_activity
+               ELSE ?
+             END,
+             progress_counter = CASE
+               WHEN ? THEN progress_counter
+               ELSE ?
+             END,
              last_heartbeat_at = ?,
              last_meaningful_change_at = CASE
+               WHEN ? THEN last_meaningful_change_at
                WHEN progress_counter <> ? OR current_activity <> ? THEN ?
                ELSE last_meaningful_change_at
              END,
              status = CASE
+               WHEN ? THEN status
                WHEN status IN ('assigned', 'blocked') THEN 'running'
                ELSE status
              END
          WHERE attempt_id = ? AND assignment_fence = ? AND status IN ('assigned', 'running', 'blocked')`,
       )
-      .run(activity, progressCounter, now, progressCounter, activity, now, attemptId, expectedFence);
+      .run(
+        livenessOnly ? 1 : 0,
+        activity,
+        livenessOnly ? 1 : 0,
+        progressCounter,
+        now,
+        livenessOnly ? 1 : 0,
+        progressCounter,
+        activity,
+        now,
+        livenessOnly ? 1 : 0,
+        attemptId,
+        expectedFence,
+      );
     return result.changes === 1;
   }
 
@@ -536,6 +616,9 @@ function decodeMessage(row: Record<string, unknown>): MessageRecord {
     kind: String(row.kind),
     payload: parseJson<unknown>(String(row.payload ?? 'null')),
     status: row.status as MessageRecord['status'],
+    lease_token: row.lease_token ? String(row.lease_token) : undefined,
+    leased_at: row.leased_at ? String(row.leased_at) : undefined,
+    lease_expires_at: row.lease_expires_at ? String(row.lease_expires_at) : undefined,
     created_at: String(row.created_at),
     delivered_at: row.delivered_at ? String(row.delivered_at) : undefined,
     expires_at: row.expires_at ? String(row.expires_at) : undefined,

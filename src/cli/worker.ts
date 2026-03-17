@@ -1,7 +1,8 @@
 import { copyFileSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, join, resolve } from 'node:path';
-import { callSocket, resolveAuthorityRoot } from './client.js';
+import { resolveAuthorityRoot } from './client.js';
+import { callWorkerTransport } from './worker-transport.js';
 
 export async function runWorkerCommand(args: string[]): Promise<void> {
   const [method, sessionId, attemptId, fenceString, ...rest] = args;
@@ -9,11 +10,10 @@ export async function runWorkerCommand(args: string[]): Promise<void> {
     throw new Error('usage: harness worker <method> <session-id> [...]');
   }
 
-  const socketPath = join(resolveAuthorityRoot(sessionId), 'worker.sock');
   let response;
   switch (method) {
     case 'heartbeat':
-      response = await callSocket(socketPath, 'heartbeat', {
+      response = await callWorkerTransport(sessionId, 'heartbeat', {
         attempt_id: String(attemptId),
         assignment_fence: Number(fenceString),
         activity: rest[0] ?? 'working',
@@ -21,7 +21,7 @@ export async function runWorkerCommand(args: string[]): Promise<void> {
       });
       break;
     case 'complete':
-      response = await callSocket(socketPath, 'complete_attempt', {
+      response = await callWorkerTransport(sessionId, 'complete_attempt', {
         attempt_id: String(attemptId),
         assignment_fence: Number(fenceString),
         status: rest[0] ?? 'completed',
@@ -29,7 +29,7 @@ export async function runWorkerCommand(args: string[]): Promise<void> {
       });
       break;
     case 'send-message':
-      response = await callSocket(socketPath, 'send_message', {
+      response = await callWorkerTransport(sessionId, 'send_message', {
         attempt_id: String(attemptId),
         assignment_fence: Number(fenceString),
         to_worker_instance_id: rest[0],
@@ -38,14 +38,14 @@ export async function runWorkerCommand(args: string[]): Promise<void> {
       });
       break;
     case 'report-blocked':
-      response = await callSocket(socketPath, 'report_blocked', {
+      response = await callWorkerTransport(sessionId, 'report_blocked', {
         attempt_id: String(attemptId),
         assignment_fence: Number(fenceString),
         reason: rest.join(' ') || 'blocked',
       });
       break;
     case 'register-artifact':
-      response = await callSocket(socketPath, 'register_artifact', {
+      response = await callWorkerTransport(sessionId, 'register_artifact', {
         attempt_id: String(attemptId),
         assignment_fence: Number(fenceString),
         artifact_id: rest[0],
@@ -63,7 +63,7 @@ export async function runWorkerCommand(args: string[]): Promise<void> {
       }
       const authorityRoot = resolveAuthorityRoot(sessionId);
       const info = ingestArtifactFile(authorityRoot, sourcePath);
-      response = await callSocket(socketPath, 'register_artifact', {
+      response = await callWorkerTransport(sessionId, 'register_artifact', {
         attempt_id: String(attemptId),
         assignment_fence: Number(fenceString),
         artifact_id: rest[0] ?? `artifact-${randomUUID()}`,
@@ -79,7 +79,7 @@ export async function runWorkerCommand(args: string[]): Promise<void> {
       break;
     }
     case 'poll':
-      response = await callSocket(socketPath, 'poll_messages', {
+      response = await callWorkerTransport(sessionId, 'poll_messages', {
         worker_instance_id: String(attemptId),
         generation: Number(fenceString ?? 1),
       });

@@ -17,7 +17,7 @@ export type TaskStatus = 'open' | 'offered' | 'active' | 'provisional' | 'valida
 export type AttemptStatus = 'assigned' | 'running' | 'blocked' | 'failed' | 'completed' | 'cancelled';
 
 export type ControllerCommandStatus = 'pending' | 'acked' | 'applied' | 'aborted' | 'reconciled';
-export type MessageStatus = 'pending' | 'delivered' | 'expired';
+export type MessageStatus = 'pending' | 'leased' | 'delivered' | 'expired';
 export type ArtifactStatus = 'sealed' | 'promoted' | 'rejected';
 export type AttemptTerminalStatus = 'completed' | 'failed' | 'cancelled';
 export type ValidationKind = 'inline' | 'operator';
@@ -121,6 +121,9 @@ export interface MessageRecord {
   kind: string;
   payload: unknown;
   status: MessageStatus;
+  lease_token?: string;
+  leased_at?: string;
+  lease_expires_at?: string;
   created_at: string;
   delivered_at?: string;
   expires_at?: string;

@@ -8,6 +8,7 @@ Initial transport:
 - newline-delimited request/response frames
 - separate sockets for worker and admin
 - CLI wrapper as the first client transport
+- auth token carried in request params by the CLI wrapper
 
 ## Admin methods
 
@@ -29,6 +30,7 @@ Initial transport:
 - `heartbeat`
 - `complete_attempt`
 - `poll_messages`
+- `ack_messages`
 - `send_message`
 - `register_artifact`
 - `report_blocked`
@@ -55,9 +57,11 @@ Terminal attempts also reject further heartbeat or completion updates even when 
 - controller restart also replays or settles pending controller commands into `reconciled` / `aborted`
 - worker launch writes an initial rehydration packet even before the first active attempt
 - worker memory is externalized to a durable file and embedded into the rehydration packet as a bounded excerpt
-- admin may enqueue directed messages; worker poll marks them delivered
-- worker runtime sidecar mirrors recent delivered messages into a runtime mailbox file
+- admin may enqueue directed messages; worker poll now leases them and worker/sidecar acknowledges them separately
+- worker runtime sidecar mirrors recent leased messages into a runtime mailbox file and then acknowledges them
 - worker runtime sidecar also sends fallback heartbeats for the current active attempt
 - worker may register sealed artifacts against the active attempt
 - admin may transition artifacts from `sealed` to `promoted` or `rejected`
 - completed attempts are validated separately through admin-side inline/operator decisions
+- assign rejects workers whose capability profile does not satisfy task `required_capabilities`
+- worker launch normalizes `capability_profile` before persisting it and projecting runtime env vars
