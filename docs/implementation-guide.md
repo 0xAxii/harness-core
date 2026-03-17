@@ -1,5 +1,22 @@
 # Implementation Guide
 
+## Scope
+
+This guide tracks the current Codex-first v1 slice.
+
+Priority order:
+1. control-plane truth in the database
+2. fenced worker mutation and durable state
+3. restart/reconcile recovery
+4. leader-first operator flow
+5. advanced features later
+
+Out of current v1 scope:
+- secret grants
+- generalized lease framework
+- environment fingerprint / effect log
+- broader multi-runtime generalization
+
 ## Initial slice
 
 Build and verify in this order:
@@ -17,17 +34,44 @@ Build and verify in this order:
 12. tmux HUD pane launcher
 13. worker mailbox + heartbeat sidecar snapshot
 
+## Adapter contract
+
+Current reality:
+- worker runtime is currently backed by detached tmux sessions
+- Codex bootstrap is the primary runtime path today
+
+Required v1 contract:
+- authority remains in controller + database state
+- `assignment_fence` remains the mutation guard
+- restart/reconcile remains valid even if pane visibility is lost
+- tmux visibility is operator convenience, not runtime truth
+
+## Minimal typed config
+
+Keep correctness-critical config small in v1:
+- `runtime_target`
+- `authority_root_policy`
+- `capability_defaults`
+- `leader_ux_mode`
+
+Do not expand this into a plugin ABI or generalized platform surface yet.
+Current implementation now validates `config_path` for `create_session` and uses `capability_defaults` as the launch-time fallback profile when `launch_worker` omits an explicit capability payload.
+
 ## Operator surface
 
+Leader-first means composing the existing worker-centric primitives into an operator flow:
+- `harness up <session-id> [--config <path>]`
+- `harness hud <session-id>`
+- `harness attach-worker <session-id>` (defaults to the leader worker)
 - `harness start <session-id>`
 - `harness stop <session-id>`
 - `harness bootstrap <session-id>`
 - `harness admin <method> <session-id> ...`
 - `harness list-workers <session-id>`
-- `harness attach-worker <session-id> <worker-instance-id> [--window <n>] [--pane <n>] [--print-target]`
-- `harness show-mailbox <session-id> <worker-instance-id>`
-- `harness show-heartbeat <session-id> <worker-instance-id>`
-- `harness tail-worker <session-id> <worker-instance-id> [--window <n>] [--pane <n>] [--lines <n>]`
+- `harness attach-worker <session-id> [worker-instance-id] [--window <n>] [--pane <n>] [--print-target]`
+- `harness show-mailbox <session-id> [worker-instance-id]`
+- `harness show-heartbeat <session-id> [worker-instance-id]`
+- `harness tail-worker <session-id> [worker-instance-id] [--window <n>] [--pane <n>] [--lines <n>]`
 - `harness hud <session-id> [--watch] [--interval <ms>]`
 - `harness hud-pane <session-id> [--interval <ms>]`
 - `harness sidecar worker-runtime <session-id> <worker-instance-id> <generation> [--interval <ms>]`
@@ -57,6 +101,7 @@ Build and verify in this order:
 - workers can explicitly enter `blocked` state and clear it by sending a later heartbeat
 - assignment checks task `required_capabilities` against the worker capability profile before creating a new attempt
 - worker launch validates and normalizes `capability_profile` before persisting it and mapping it into runtime env
+- session config is validated through a narrow JSON loader and can provide default worker capabilities
 
 ## Tier 0 tables
 

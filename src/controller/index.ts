@@ -5,9 +5,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { HarnessDatabase } from '../db/index.js';
 import { failure, success, type JsonRpcRequest, type JsonRpcResponse } from '../protocol/jsonrpc.js';
-import type { CapabilityProfile, SessionRecord, TaskRecord, WorkerInstanceRecord } from '../types/model.js';
+import type { CapabilityProfile, SessionConfig, SessionRecord, TaskRecord, WorkerInstanceRecord } from '../types/model.js';
 import { ensureWorkerMemoryFile, readWorkerMemory } from '../runtime/memory.js';
 import { EmbeddedSupervisor } from '../runtime/supervisor.js';
+import { loadSessionConfig } from '../config/session-config.js';
 
 export interface ControllerPaths {
   dbPath: string;
@@ -27,6 +28,14 @@ const VALIDATION_DECISIONS = new Set(['accepted', 'rejected']);
 const VALIDATION_KINDS = new Set(['inline', 'operator']);
 const ARTIFACT_TRANSITIONS = new Set(['promoted', 'rejected']);
 const NETWORK_PROFILES = new Set(['deny', 'local', 'full']);
+const DEFAULT_CAPABILITY_PROFILE: CapabilityProfile = {
+  fs_scope: [],
+  network_profile: 'deny',
+  browser_access: false,
+  publish_right: false,
+  shared_resource_modes: [],
+  secret_classes: [],
+};
 
 function isAttemptTerminalStatus(value: string): value is 'completed' | 'failed' | 'cancelled' {
   return ATTEMPT_TERMINAL_STATUSES.has(value);
@@ -68,6 +77,18 @@ function normalizeCapabilityProfile(value: unknown): CapabilityProfile {
     shared_resource_modes: normalizeStringArray(source.shared_resource_modes, 'capability_profile.shared_resource_modes'),
     secret_classes: normalizeStringArray(source.secret_classes, 'capability_profile.secret_classes'),
   };
+}
+
+function buildCapabilityProfile(value: unknown, defaults: CapabilityProfile = DEFAULT_CAPABILITY_PROFILE): CapabilityProfile {
+  const source = (value ?? {}) as Record<string, unknown>;
+  return normalizeCapabilityProfile({
+    fs_scope: source.fs_scope ?? defaults.fs_scope,
+    network_profile: source.network_profile ?? defaults.network_profile,
+    browser_access: source.browser_access ?? defaults.browser_access,
+    publish_right: source.publish_right ?? defaults.publish_right,
+    shared_resource_modes: source.shared_resource_modes ?? defaults.shared_resource_modes,
+    secret_classes: source.secret_classes ?? defaults.secret_classes,
+  });
 }
 
 function workerSupportsCapabilities(profile: CapabilityProfile, required: string[]): boolean {
@@ -210,6 +231,13 @@ export class HarnessController {
     }
   }
 
+  private resolveSessionConfig(session: Pick<SessionRecord, 'config_path'>): { path: string; config: SessionConfig } | null {
+    if (!session.config_path) {
+      return null;
+    }
+    return loadSessionConfig(session.config_path);
+  }
+
   private async handleAdminRequest(request: JsonRpcRequest): Promise<JsonRpcResponse> {
     const authFailure = this.authorizeAdminRequest(request);
     if (authFailure) {
@@ -280,11 +308,28 @@ export class HarnessController {
   private createSession(request: JsonRpcRequest): JsonRpcResponse {
     const params = request.params ?? {};
     const now = new Date().toISOString();
+    let loadedSessionConfig: { path: string; config: SessionConfig } | null = null;
+    const requestedConfigPath = typeof params.config_path === 'string' && params.config_path.length > 0
+      ? params.config_path
+      : undefined;
+    if (requestedConfigPath) {
+      try {
+        loadedSessionConfig = loadSessionConfig(requestedConfigPath);
+      } catch (error) {
+        return failure(request.id, 400, 'invalid session config', String(error));
+      }
+    }
+    const requestedAuthorityRoot = typeof params.authority_root === 'string' && params.authority_root.trim().length > 0
+      ? params.authority_root.trim()
+      : undefined;
+    if (loadedSessionConfig?.config.authority_root_policy === 'explicit' && !requestedAuthorityRoot) {
+      return failure(request.id, 400, 'authority_root required by session config');
+    }
     const record: SessionRecord = {
       session_id: String(params.session_id),
       family: 'code-oriented',
-      config_path: typeof params.config_path === 'string' ? params.config_path : undefined,
-      authority_root: String(params.authority_root),
+      config_path: loadedSessionConfig?.path,
+      authority_root: requestedAuthorityRoot ?? dirname(this.paths.dbPath),
       status: 'active',
       created_at: now,
       updated_at: now,
@@ -298,7 +343,13 @@ export class HarnessController {
       subject_type: 'session',
       subject_id: record.session_id,
       mutation_id: randomUUID(),
-      payload: { family: record.family },
+      payload: {
+        family: record.family,
+        config_path: record.config_path ?? null,
+        runtime_target: loadedSessionConfig?.config.runtime_target ?? null,
+        authority_root_policy: loadedSessionConfig?.config.authority_root_policy ?? null,
+        leader_ux_mode: loadedSessionConfig?.config.leader_ux_mode ?? null,
+      },
       created_at: now,
     });
     return success(request.id, { session_id: record.session_id });
@@ -312,9 +363,15 @@ export class HarnessController {
       return failure(request.id, 404, 'session not found');
     }
     const now = new Date().toISOString();
+    let sessionConfig: { path: string; config: SessionConfig } | null = null;
+    try {
+      sessionConfig = this.resolveSessionConfig(session);
+    } catch (error) {
+      return failure(request.id, 400, 'invalid session config', String(error));
+    }
     let capabilityProfile: CapabilityProfile;
     try {
-      capabilityProfile = normalizeCapabilityProfile(params.capability_profile);
+      capabilityProfile = buildCapabilityProfile(params.capability_profile, sessionConfig?.config.capability_defaults);
     } catch (error) {
       return failure(request.id, 400, 'invalid capability_profile', String(error));
     }

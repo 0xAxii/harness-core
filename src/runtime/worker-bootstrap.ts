@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { CapabilityProfile } from '../types/model.js';
+import type { RuntimeAdapterContract } from './adapter.js';
 
 export interface WorkerBootstrapOptions {
   authorityRoot: string;
@@ -14,6 +15,7 @@ export interface WorkerBootstrapOptions {
   memoryRef?: string;
   memoryPath: string;
   capabilityProfile: CapabilityProfile;
+  runtimeAdapter: RuntimeAdapterContract;
 }
 
 export function writeWorkerBootstrapScript(options: WorkerBootstrapOptions): string {
@@ -36,6 +38,17 @@ function buildWorkerPrompt(options: WorkerBootstrapOptions): string {
   return [
     `You are worker ${options.workerInstanceId} for harness session ${options.sessionId}.`,
     `Your role label is ${options.roleLabel}.`,
+    '',
+    `Current runtime adapter: ${options.runtimeAdapter.kind}.`,
+    `Authority source: ${options.runtimeAdapter.authority_source}.`,
+    'This live tmux/Codex session hosts the worker, but authoritative task, fence, and recovery state remain in the harness controller/database.',
+    '',
+    'Quick flow for most work:',
+    '1. Read the rehydration packet.',
+    '2. Confirm the active attempt.',
+    '3. Work on that attempt only.',
+    '4. Send heartbeat updates when progress changes.',
+    '5. Complete, fail, or mark blocked through the harness CLI.',
     '',
     'Bootstrap rules:',
     `1. Read the rehydration packet at ${join(options.authorityRoot, 'rehydration', `${options.workerInstanceId}.json`)}.`,
@@ -72,6 +85,7 @@ function buildWorkerPrompt(options: WorkerBootstrapOptions): string {
     `Capability profile: ${JSON.stringify(options.capabilityProfile)}`,
     'Treat the capability profile as a hard runtime boundary. Do not assume network, browser, shared-write, or publish access beyond what it grants.',
     '',
+    'Advanced shell helpers:',
     'Shell helpers are preloaded in the session:',
     '- harness_attempt_id',
     '- harness_fence',

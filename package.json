@@ -17,7 +17,9 @@
     "smoke:multi-worker": "node ./scripts/multi-worker-smoke.mjs",
     "smoke:restart-reconcile": "node ./scripts/restart-reconcile-smoke.mjs",
     "smoke:cancel-replay": "node ./scripts/cancel-replay-smoke.mjs",
-    "smoke:gate-fix": "node ./scripts/gate-fix-smoke.mjs"
+    "smoke:gate-fix": "node ./scripts/gate-fix-smoke.mjs",
+    "smoke:session-config": "node ./scripts/session-config-smoke.mjs",
+    "smoke:operator-happy-path": "node ./scripts/operator-happy-path-smoke.mjs"
   },
   "engines": {
     "node": ">=20"

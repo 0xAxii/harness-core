@@ -6,8 +6,16 @@ import { callSocket, resolveAuthorityRoot } from './client.js';
 
 const READY_TIMEOUT_MS = 5_000;
 
-export async function runStartCommand(args: string[]): Promise<void> {
-  const [sessionId = 'dev-session'] = args;
+interface StartControllerOptions {
+  quiet?: boolean;
+}
+
+export async function startController(sessionId: string, options: StartControllerOptions = {}): Promise<{
+  session_id: string;
+  pid: number;
+  pid_path: string;
+  log_path: string;
+}> {
   const authorityRoot = resolveAuthorityRoot(sessionId);
   const runtimeDir = join(authorityRoot, 'runtime');
   const logDir = join(runtimeDir, 'logs');
@@ -42,18 +50,23 @@ export async function runStartCommand(args: string[]): Promise<void> {
     throw error;
   }
 
-  process.stdout.write(
-    JSON.stringify(
-      {
-        session_id: sessionId,
-        pid: child.pid,
-        pid_path: pidPath,
-        log_path: logPath,
-      },
-      null,
-      2,
-    ) + '\n',
-  );
+  const result = {
+    session_id: sessionId,
+    pid: child.pid,
+    pid_path: pidPath,
+    log_path: logPath,
+  };
+
+  if (!options.quiet) {
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+  }
+
+  return result;
+}
+
+export async function runStartCommand(args: string[]): Promise<void> {
+  const [sessionId = 'dev-session'] = args;
+  await startController(sessionId);
 }
 
 export async function runStopCommand(args: string[]): Promise<void> {

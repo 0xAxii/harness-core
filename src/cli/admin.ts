@@ -17,6 +17,7 @@ export async function runAdminCommand(args: string[]): Promise<void> {
         session_id: sessionId,
         family: 'code-oriented',
         authority_root: authorityRoot,
+        config_path: parseConfigPath(rest),
       });
       break;
     case 'launch-worker':
@@ -25,14 +26,6 @@ export async function runAdminCommand(args: string[]): Promise<void> {
         worker_instance_id: rest[0] ?? `worker-${randomUUID()}`,
         role_label: rest[1] ?? 'general',
         memory_ref: rest[2] || undefined,
-        capability_profile: {
-          fs_scope: [],
-          network_profile: 'deny',
-          browser_access: false,
-          publish_right: false,
-          shared_resource_modes: [],
-          secret_classes: [],
-        },
       });
       break;
     case 'create-task':
@@ -122,4 +115,16 @@ export async function runAdminCommand(args: string[]): Promise<void> {
   }
 
   process.stdout.write(`${JSON.stringify(response, null, 2)}\n`);
+}
+
+function parseConfigPath(args: string[]): string | undefined {
+  const configFlagIndex = args.findIndex((arg) => arg === '--config');
+  if (configFlagIndex === -1) {
+    return undefined;
+  }
+  const value = args[configFlagIndex + 1];
+  if (!value) {
+    throw new Error('usage: harness admin create-session <session-id> [--config <path>]');
+  }
+  return value;
 }

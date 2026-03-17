@@ -14,6 +14,7 @@ import {
 } from './operators.js';
 import { runSidecarCommand } from './sidecar.js';
 import { resolveAuthorityRoot } from './client.js';
+import { runUpCommand } from './up.js';
 import { runWorkerCommand } from './worker.js';
 
 async function bootstrap(sessionId: string): Promise<void> {
@@ -49,15 +50,23 @@ function printHelp(): void {
       'usage: harness <command> ...',
       '',
       'commands:',
+      '  up <session-id> [--config <path>]',
+      '',
+      'quick start:',
+      '  harness up <session-id> [--config <path>]',
+      '  harness hud <session-id>',
+      '  harness attach-worker <session-id>    # defaults to leader worker',
+      '',
+      'advanced commands:',
       '  bootstrap <session-id>',
       '  start <session-id>',
       '  stop <session-id>',
       '  admin <method> <session-id> ...',
       '  list-workers <session-id>',
-      '  attach-worker <session-id> <worker-instance-id> [--window <n>] [--pane <n>] [--print-target]',
-      '  show-mailbox <session-id> <worker-instance-id>',
-      '  show-heartbeat <session-id> <worker-instance-id>',
-      '  tail-worker <session-id> <worker-instance-id> [--window <n>] [--pane <n>] [--lines <n>]',
+      '  attach-worker <session-id> [worker-instance-id] [--window <n>] [--pane <n>] [--print-target]',
+      '  show-mailbox <session-id> [worker-instance-id]',
+      '  show-heartbeat <session-id> [worker-instance-id]',
+      '  tail-worker <session-id> [worker-instance-id] [--window <n>] [--pane <n>] [--lines <n>]',
       '  hud <session-id> [--watch] [--interval <ms>]',
       '  hud-pane <session-id> [--interval <ms>]',
       '  sidecar worker-runtime <session-id> <worker-instance-id> <generation> [--interval <ms>]',
@@ -71,6 +80,9 @@ async function main(): Promise<void> {
   switch (command) {
     case 'bootstrap':
       await bootstrap(rest[0] ?? 'dev-session');
+      return;
+    case 'up':
+      await runUpCommand(rest);
       return;
     case 'admin':
       await runAdminCommand(rest);

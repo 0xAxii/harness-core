@@ -22,6 +22,10 @@ export type ArtifactStatus = 'sealed' | 'promoted' | 'rejected';
 export type AttemptTerminalStatus = 'completed' | 'failed' | 'cancelled';
 export type ValidationKind = 'inline' | 'operator';
 export type ValidationDecision = 'accepted' | 'rejected';
+export type RuntimeTarget = 'codex';
+export type AuthorityRootPolicy = 'explicit' | 'xdg-state';
+export type LeaderUxMode = 'leader-first' | 'worker-centric';
+export type SessionConfigPath = string;
 
 export interface CapabilityProfile {
   fs_scope: string[];
@@ -32,10 +36,17 @@ export interface CapabilityProfile {
   secret_classes: string[];
 }
 
+export interface SessionConfig {
+  runtime_target: RuntimeTarget;
+  authority_root_policy: AuthorityRootPolicy;
+  capability_defaults: CapabilityProfile;
+  leader_ux_mode: LeaderUxMode;
+}
+
 export interface SessionRecord {
   session_id: string;
   family: SessionFamily;
-  config_path?: string;
+  config_path?: SessionConfigPath;
   authority_root: string;
   status: SessionStatus;
   created_at: string;

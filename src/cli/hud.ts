@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import type { JsonRpcFailure } from '../protocol/jsonrpc.js';
 import { callSocket, resolveAuthorityRoot } from './client.js';
+import { isLeaderWorker, resolveLeaderWorker } from './leader.js';
 
 interface StatusPayload {
   session: {
@@ -63,7 +64,13 @@ function renderHud(payload: StatusPayload): string {
   const session = payload.session;
   const tasks = payload.tasks ?? [];
   const workers = payload.workers ?? [];
+  const leaderWorker = resolveLeaderWorker(workers);
   const attempts = payload.attempts ?? [];
+  const orderedAttempts = attempts.slice().sort((left, right) => {
+    const leftIsLeader = leaderWorker && left.worker_instance_id === leaderWorker.worker_instance_id ? 1 : 0;
+    const rightIsLeader = leaderWorker && right.worker_instance_id === leaderWorker.worker_instance_id ? 1 : 0;
+    return rightIsLeader - leftIsLeader;
+  });
   const artifacts = payload.artifacts ?? [];
   const validations = payload.validations ?? [];
   const commands = payload.controller_commands ?? [];
@@ -72,6 +79,7 @@ function renderHud(payload: StatusPayload): string {
   lines.push(`Family   ${session.family}`);
   lines.push(`Status   ${session.status}`);
   lines.push(`Root     ${session.authority_root}`);
+  lines.push(`Leader   ${leaderWorker ? `${leaderWorker.worker_instance_id} (${leaderWorker.role_label})` : '-'}`);
   lines.push('');
 
   lines.push(`Tasks (${tasks.length})`);
@@ -83,22 +91,26 @@ function renderHud(payload: StatusPayload): string {
 
   lines.push(`Workers (${workers.length})`);
   lines.push(...renderTable(
-    ['worker_id', 'role', 'gen', 'state', 'attempt', 'blocked'],
-    workers.map((worker) => [
-      worker.worker_instance_id,
-      worker.role_label,
-      String(worker.generation),
-      worker.supervisor_state,
-      worker.current_attempt_id ?? '-',
-      worker.blocked_reason ?? '-',
-    ]),
+    ['default', 'worker_id', 'role', 'gen', 'state', 'attempt', 'blocked'],
+    workers
+      .slice()
+      .sort((left, right) => Number(isLeaderWorker(right, leaderWorker?.worker_instance_id)) - Number(isLeaderWorker(left, leaderWorker?.worker_instance_id)))
+      .map((worker) => [
+        isLeaderWorker(worker, leaderWorker?.worker_instance_id) ? 'leader' : '-',
+        worker.worker_instance_id,
+        worker.role_label,
+        String(worker.generation),
+        worker.supervisor_state,
+        worker.current_attempt_id ?? '-',
+        worker.blocked_reason ?? '-',
+      ]),
   ));
   lines.push('');
 
   lines.push(`Attempts (${attempts.length})`);
   lines.push(...renderTable(
     ['attempt_id', 'task_id', 'worker', 'fence', 'status', 'activity', 'progress', 'last_hb', 'last_change'],
-    attempts.map((attempt) => [
+    orderedAttempts.map((attempt) => [
       attempt.attempt_id,
       attempt.task_id,
       attempt.worker_instance_id,

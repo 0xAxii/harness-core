@@ -1,17 +1,17 @@
-import type { CapabilityProfile, SessionFamily } from '../types/model.js';
+import type { CapabilityProfile, SessionConfigPath, SessionFamily } from '../types/model.js';
 
 export interface CreateSessionParams {
   session_id: string;
   family: SessionFamily;
   authority_root: string;
-  config_path?: string;
+  config_path?: SessionConfigPath;
 }
 
 export interface LaunchWorkerParams {
   session_id: string;
   worker_instance_id: string;
   role_label: string;
-  capability_profile: CapabilityProfile;
+  capability_profile?: CapabilityProfile;
   memory_ref?: string;
 }
 

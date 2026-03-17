@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { JsonRpcFailure } from '../protocol/jsonrpc.js';
 import { callSocket, resolveAuthorityRoot } from './client.js';
+import { isLeaderWorker, resolveLeaderWorker } from './leader.js';
 
 interface WorkerSummary {
   worker_instance_id: string;
@@ -26,16 +27,18 @@ export async function runListWorkersCommand(args: string[]): Promise<void> {
     return;
   }
 
+  const leader = resolveLeaderWorker(workers);
   const rows = workers.map((worker) => [
+    isLeaderWorker(worker, leader?.worker_instance_id) ? 'leader' : '-',
     worker.worker_instance_id,
     worker.role_label,
     String(worker.generation),
     worker.supervisor_state,
     worker.current_attempt_id ?? '-',
     worker.runtime_handle ?? '-',
-  ]);
+  ]).sort((a, b) => Number(b[0] === 'leader') - Number(a[0] === 'leader'));
   process.stdout.write(renderTable(
-    ['worker_id', 'role', 'gen', 'state', 'attempt', 'runtime'],
+    ['default', 'worker_id', 'role', 'gen', 'state', 'attempt', 'runtime'],
     rows,
   ));
 }
@@ -44,16 +47,9 @@ export async function runAttachWorkerCommand(args: string[]): Promise<void> {
   const printOnly = args.includes('--print-target');
   const { filteredArgs, target } = parseTmuxTargetArgs(args.filter((arg) => arg !== '--print-target'));
   const [sessionId = 'dev-session', workerId] = filteredArgs;
-  if (!workerId) {
-    throw new Error('usage: harness attach-worker <session-id> <worker-instance-id> [--window <n>] [--pane <n>] [--print-target]');
-  }
-  const payload = await fetchStatus(sessionId);
-  const worker = (payload.workers ?? []).find((entry) => entry.worker_instance_id === workerId);
-  if (!worker) {
-    throw new Error(`worker not found: ${workerId}`);
-  }
+  const worker = await fetchWorker(sessionId, workerId);
   if (!worker.runtime_handle?.startsWith('tmux:')) {
-    throw new Error(`worker ${workerId} has no tmux runtime handle`);
+    throw new Error(`worker ${worker.worker_instance_id} has no tmux runtime handle`);
   }
   const tmuxSession = worker.runtime_handle.slice('tmux:'.length);
   const tmuxTarget = `${tmuxSession}:${target.window}.${target.pane}`;
@@ -76,21 +72,17 @@ export async function runAttachWorkerCommand(args: string[]): Promise<void> {
 
 export async function runShowMailboxCommand(args: string[]): Promise<void> {
   const [sessionId = 'dev-session', workerId] = args;
-  if (!workerId) {
-    throw new Error('usage: harness show-mailbox <session-id> <worker-instance-id>');
-  }
+  const worker = await fetchWorker(sessionId, workerId);
   const authorityRoot = resolveAuthorityRoot(sessionId);
-  const mailboxPath = join(authorityRoot, 'runtime', 'mailbox', `${workerId}.json`);
+  const mailboxPath = join(authorityRoot, 'runtime', 'mailbox', `${worker.worker_instance_id}.json`);
   process.stdout.write(readRuntimeJsonFile(mailboxPath));
 }
 
 export async function runShowHeartbeatCommand(args: string[]): Promise<void> {
   const [sessionId = 'dev-session', workerId] = args;
-  if (!workerId) {
-    throw new Error('usage: harness show-heartbeat <session-id> <worker-instance-id>');
-  }
+  const worker = await fetchWorker(sessionId, workerId);
   const authorityRoot = resolveAuthorityRoot(sessionId);
-  const heartbeatPath = join(authorityRoot, 'runtime', 'heartbeat', `${workerId}.json`);
+  const heartbeatPath = join(authorityRoot, 'runtime', 'heartbeat', `${worker.worker_instance_id}.json`);
   process.stdout.write(readRuntimeJsonFile(heartbeatPath));
 }
 
@@ -100,12 +92,9 @@ export async function runTailWorkerCommand(args: string[]): Promise<void> {
   const withoutLines = args.filter((_, index) => index !== linesArgIndex && index !== linesArgIndex + 1);
   const { filteredArgs, target } = parseTmuxTargetArgs(withoutLines);
   const [sessionId = 'dev-session', workerId] = filteredArgs;
-  if (!workerId) {
-    throw new Error('usage: harness tail-worker <session-id> <worker-instance-id> [--window <n>] [--pane <n>] [--lines <n>]');
-  }
   const worker = await fetchWorker(sessionId, workerId);
   if (!worker.runtime_handle?.startsWith('tmux:')) {
-    throw new Error(`worker ${workerId} has no tmux runtime handle`);
+    throw new Error(`worker ${worker.worker_instance_id} has no tmux runtime handle`);
   }
   const tmuxSession = worker.runtime_handle.slice('tmux:'.length);
   const tmuxTarget = `${tmuxSession}:${target.window}.${target.pane}`;
@@ -126,11 +115,14 @@ async function fetchStatus(sessionId: string): Promise<StatusPayload> {
   return response.result as StatusPayload;
 }
 
-async function fetchWorker(sessionId: string, workerId: string): Promise<WorkerSummary> {
+async function fetchWorker(sessionId: string, workerId?: string): Promise<WorkerSummary> {
   const payload = await fetchStatus(sessionId);
-  const worker = (payload.workers ?? []).find((entry) => entry.worker_instance_id === workerId);
+  const workers = payload.workers ?? [];
+  const worker = workerId
+    ? workers.find((entry) => entry.worker_instance_id === workerId)
+    : resolveLeaderWorker(workers);
   if (!worker) {
-    throw new Error(`worker not found: ${workerId}`);
+    throw new Error(workerId ? `worker not found: ${workerId}` : `no worker available for session ${sessionId}`);
   }
   return worker;
 }
